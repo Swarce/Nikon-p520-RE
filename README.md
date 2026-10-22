@@ -11,7 +11,8 @@ Goal: enable RAW (NRW) stills.
 | Integrity (32-bit byte-sum @ 0x4d80110) | solved |
 | HW-inflate codec (Zoran COACH type-2) | **solved**: it's DEFLATE with MSB-first bits and canonical codes implied by HW lookup tables. Decode, bit-exact re-encode and bit-exact table rebuild for all 646 blocks. See [docs/CODEC_SOLVED.md](docs/CODEC_SOLVED.md) |
 | Patch pipeline | **working**: patch any main-app address, recompress in place, reseal, re-encrypt (`tools/p520fw.py`) |
-| RAW gate | **found**: the Fn menu links to the "quality without RAW" popup (0x33) instead of the shipped RAW popup (0x32). Candidate patch in [docs/RAW_GATE.md](docs/RAW_GATE.md). **Not yet tested on a camera.** |
+| RAW gate | **SOLVED + confirmed on hardware**: two edits enable NRW (menu stores a RAW quality + neuter the RAW→JPEG conversion). The camera shoots valid `.NRW`. See [docs/RAW_ENABLE.md](docs/RAW_ENABLE.md). `RAW_GATE.md` is the earlier (wrong) menu-link guess. |
+| NRW desktop use | `.NRW` needs a one-time endianness/bit-depth fix for standard converters — [tools/nrwfix.py](tools/nrwfix.py). |
 
 ## Quick start
 
