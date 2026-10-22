@@ -39,18 +39,21 @@ then cleared with a one-line model entry. Current reach, in order:
 | `_gpr_shadow_check` | spins waiting for CP0 SRSCtl.HSS (shadow reg sets Unicorn lacks) | `CPU_SHIMS` sets HSS after the `mfc0` |
 | `_tx_thread_create → stack_build` | system stack at top of RAM (`0xdfffff70`) | map full 512MB DRAM (TLB even+odd pair) |
 | `tx_application_define → PoolInit → DcuGetDramAttributes` | reads DRAM-geometry index (`0x18003c10`), 0 = "Unknown main DRAM size" | `MMIO_MODEL[0x18003c10]=7` (512MB) |
-| **`PoolCreateDirect` (current)** | calls `procStruct->createFn` (`[v0+0x1c]`) which is **null** | C++ pool-proc not registered — see below |
+| `PoolInit → PoolCreateDirect → CreateDirect` | the pool proc structs are valid (static rodata, non-null `createFn`), it enters `CreateDirect`, then **execution reaches PC=0** | under investigation |
 
 So from a cold image it now runs through CPU init, the MMU bringup, clock/DRAM self-checks,
 the ThreadX kernel, thread creation, and into memory-pool setup — hundreds of real functions.
 
-## The current wall: C++ static initialization
+## The current wall: a jump to PC=0 inside pool CreateDirect
 
-The firmware is C++ (`CCguUnitMgmtImpl::`, vtables, proc structs). `PoolCreateDirect` fetches a
-pool's "create" function pointer from a proc struct and it's null — the registration that fills
-it normally runs in a **global/static constructor** (`.init_array`). The next step is to
-confirm whether `main`/crt0 runs the ctor list and, if not, invoke it (or the specific pool
-registration) before `tx_application_define`. This is a known, bounded category, not a mystery.
+Ruled out: the pool-proc lookup. `PoolGetPoolProc` returns valid static structs and their
+`createFn` (`+0x1c`) points at real code (`CreateDirect` @ `0xc0016328`), which the emulator
+does enter. Shortly after, the PC becomes 0 (a null call or a corrupted return). `CreateDirect`
+calls `Init` (`0xc00161d4`); the likely causes are (a) a function pointer / callback that a
+skipped init left null, or (b) the firmware's low-address TLB entry (vaddr 0 → phys
+`0x40000000`, set by the helper at `0xc00006c4` which cold start hasn't run) so a low-address
+access misbehaves. Next step: instruction-level single-step across the last block before the
+fault to see the exact transfer to 0. The fault handler now prints the recent accesses to help.
 
 ## Methodology (how to clear the next wall)
 

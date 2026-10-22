@@ -111,8 +111,13 @@ def main():
         return out.decode("latin1", "replace")
 
     seen = set()
+    last_acc = []
     def h_unmapped(uc, access, address, size, value, user):
         pg = address & ~0xFFF
+        last_acc.append((("W" if access in (UC_MEM_WRITE, UC_MEM_WRITE_UNMAPPED) else
+                          "X" if access in (UC_MEM_FETCH, UC_MEM_FETCH_UNMAPPED) else "R"),
+                         address, uc.reg_read(UC_MIPS_REG_PC)))
+        if len(last_acc) > 6: last_acc.pop(0)
         if a.mmio and pg not in seen:
             seen.add(pg); pc = uc.reg_read(UC_MIPS_REG_PC)
             t = "W" if access in (UC_MEM_WRITE, UC_MEM_WRITE_UNMAPPED) else "R"
@@ -201,6 +206,8 @@ def main():
         pc = uc.reg_read(UC_MIPS_REG_PC)
         print("\n[FAULT] %s  PC=0x%08x (%s)  RA=0x%08x (%s)" % (e, pc, nearest(pc),
               uc.reg_read(UC_MIPS_REG_RA), nearest(uc.reg_read(UC_MIPS_REG_RA))))
+        print("  last accesses (type addr pc):")
+        for t, ad, p in last_acc[-6:]: print("     %s 0x%08x  (pc 0x%08x %s)" % (t, ad, p, nearest(p)))
         for x in recent[-16:]: print("    0x%08x  %s" % (x, nearest(x)))
 
 if __name__ == "__main__":
