@@ -19,12 +19,46 @@ the two things that are **not** knowable from the firmware alone.
   runs before the main app. That's the only code path that can overwrite the bad app without
   the bad app's help.
 
+## Board-level findings (from board photos, 2026-10-22)
+
+Confirmed against mainboard photos + the firmware:
+
+* **Zoran COACH SoC** (large BGA) + a **Micron memory BGA** beside it (marking `…D9P… 3Q68`).
+  On this class of camera that Micron part is typically an **MCP — mobile DDR *and* NAND in
+  one package.** The bootloader confirms NAND is the firmware medium: `BurnNand`,
+  `NandReadElfCode`, `NandUserAreaBackup/Restore` are all present and the boot path reads the
+  app ELF from NAND.
+* **The firmware (bootloader + app + "internal memory") is in that NAND, inside a BGA.** There
+  is **no socketed/8-pin SPI-NOR** holding the firmware. The small 8-pin chip top-left
+  (`9PS3 326D7`) is not the boot source — it's almost certainly a small serial EEPROM for
+  lens/AF *adjustment data*, not something you reflash to recover.
+* **Consequence:** the cheap "clip a CH341A onto the flash and rewrite it" route does **not**
+  apply here. Getting at the NAND directly means chip-off (hot-air removal, reball, and a NAND
+  programmer that knows this exact MCP plus its ECC/bad-block layout) — advanced, risky, and
+  the opposite of hassle-free. Don't go there.
+* **The annotated photo** (red **"T"** + a yellow wire on a large round gold pad on the
+  right-center edge; blue wires on bottom-edge pads) shows someone tapped the board's
+  **factory test points**. Those big round edge pads are exactly where UART / reset / boot
+  straps are brought out. That tap is the lead worth chasing — but I can't confirm from a
+  photo which pad is TX/RX/GND vs. a strap. Treat "T" as a *candidate* TX and verify with a
+  multimeter / the boot-log monitor before trusting it.
+
 ## The honest bottom line
 
-**The single highest-success, probably-cheapest-in-the-end option is a camera repair shop
-(or Nikon service, if still offered in your region).** They have the factory jig and the
-correct factory burn image and can reflash in minutes. I recommend getting a quote before
-buying tools. Here's why the DIY path has real uncertainty:
+Given the NAND-in-BGA reality, the two most sensible options are a **board swap** or a
+**repair shop** — both avoid burn mode entirely:
+
+* **Replacement mainboard (most hassle-free).** Working P520 mainboards show up on
+  eBay/AliExpress. Swapping the board (FPC connectors + a few screws, no fine-pad soldering)
+  gives you a **booting camera on stock firmware**, after which you re-apply the *safe* NRW
+  build (value + neuter, **no** label patch) through the normal SD-card update menu. Caveat:
+  the new board carries its own adjustment EEPROM, so AF/zoom calibration may be slightly off
+  vs. your lens unit — usually fine in practice; a shop can fine-tune if needed.
+* **Repair shop / Nikon service.** They have the factory jig + correct burn image and reflash
+  in minutes. Get a quote before buying tools.
+
+A full **DIY burn-mode unbrick** (below) is the "proper" fix and the most educational, but it
+has two gaps that aren't knowable from firmware, so treat it as a project, not a quick fix:
 
 ### Gap 1 — entering burn mode is a *hardware* choice, not software
 
