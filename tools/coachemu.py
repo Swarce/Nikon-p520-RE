@@ -49,6 +49,12 @@ CPU_SHIMS = {
     0xc008b528: ("T3", 0x0C000000),
 }
 
+# Functions to neuter (force an immediate `return` on entry): hardware self-checks that have
+# no real silicon behind them in the emulator. Keep this list short and justified.
+NEUTER_FUNCS = {
+    0xc001fc58: "CCguUnitMgmtImpl::VerifyUnits (CGU clock-gating self-check vs real HW status)",
+}
+
 def v2p(a):
     a &= 0xffffffff
     if 0xc0000000 <= a < 0xe0000000: return P_DRAM + (a - 0xc0000000)   # cached, 512MB
@@ -72,6 +78,7 @@ def main():
     ap.add_argument("--peek", default="", help="comma-separated VAs (hex) to dump as words at each halt")
     ap.add_argument("--watch", default="", help="PHYS lo:hi (hex): log every read in range with PC")
     ap.add_argument("--itrace", default="", help="VADDR lo:hi (hex): ring-buffer instr trace in range, dumped on fault")
+    ap.add_argument("--tick", action="store_true", help="drive a ThreadX timer tick from the scheduler idle wait")
     a = ap.parse_args()
 
     img = bytearray(open(a.image, "rb").read())
@@ -187,6 +194,45 @@ def main():
     for sa, (rn, mask) in CPU_SHIMS.items():
         uc.hook_add(UC_HOOK_CODE, mk_shim(rn, mask), begin=sa, end=sa)
 
+    def h_neuter(uc, address, size, user):           # force immediate return
+        uc.reg_write(UC_MIPS_REG_PC, uc.reg_read(UC_MIPS_REG_RA))
+    for na in NEUTER_FUNCS:
+        uc.hook_add(UC_HOOK_CODE, h_neuter, begin=na, end=na)
+
+    # Timer tick: ThreadX's _tx_thread_schedule idles at `wait` (0xc008b2f0) when no thread is
+    # ready. Real hardware fires a periodic timer IRQ whose ISR runs _tx_timer_interrupt to
+    # expire sleeps and ready threads. We have no interrupt source, so when the scheduler would
+    # wait we instead call _tx_timer_interrupt (0xc008ac54) and return into the scheduler entry
+    # (0xc008b29c), which re-establishes its state and re-checks the ready list. One pass = one tick.
+    TX_WAIT, TX_TIMER_INT, TX_SCHED = 0xc008b2f0, 0xc008ac54, 0xc008b29c
+    ticks = [0]
+    def h_tick(uc, address, size, user):
+        ticks[0] += 1
+        uc.reg_write(UC_MIPS_REG_RA, TX_SCHED)
+        uc.reg_write(UC_MIPS_REG_PC, TX_TIMER_INT)
+    if a.tick:
+        uc.hook_add(UC_HOOK_CODE, h_tick, begin=TX_WAIT, end=TX_WAIT)
+
+    # EBase CPUNum fix: Unicorn reports CP0 EBase (r15 sel1) CPUNum = 0x3ff, but this is the
+    # main core (0). The firmware dispatches per-core off `mfc0 rt,$15,1` and picks different
+    # control blocks for core 0 vs others, so a bogus CPUNum sends reads and writes to
+    # different blocks (e.g. _tx_initialize_unused_memory written to the Cop block, read from
+    # the main block -> null pool base). Find every EBase read and mask CPUNum to 0 right after.
+    GPR = ["ZERO","AT","V0","V1","A0","A1","A2","A3","T0","T1","T2","T3","T4","T5","T6","T7",
+           "S0","S1","S2","S3","S4","S5","S6","S7","T8","T9","K0","K1","GP","SP","FP","RA"]
+    def mk_ebase_clear(regname):
+        reg = getattr(mc, "UC_MIPS_REG_" + regname)
+        return lambda uc, address, size, user: uc.reg_write(reg, uc.reg_read(reg) & ~0x3ff)
+    n_eb = 0
+    for off in range(0, len(img) - 3, 4):
+        w = int.from_bytes(img[off:off+4], "little")
+        if (w >> 26) == 0x10 and ((w >> 21) & 0x1f) == 0 and ((w >> 11) & 0x1f) == 15 and (w & 0x7ff) == 1:
+            rt = (w >> 16) & 0x1f
+            uc.hook_add(UC_HOOK_CODE, mk_ebase_clear(GPR[rt]),
+                        begin=0xc0000000 + off + 4, end=0xc0000000 + off + 4)
+            n_eb += 1
+    print("[ebase] masked CPUNum at %d EBase-read sites" % n_eb)
+
     recent = []
     def h_blk(uc, address, size, user):
         recent.append(address)
@@ -225,6 +271,9 @@ def main():
         for rn in ("A0", "A1", "A2", "A3", "S0", "S1", "SP", "GP"):
             print("  %-3s=0x%08x" % (rn, uc.reg_read(getattr(__import__('unicorn.mips_const', fromlist=['x']), 'UC_MIPS_REG_' + rn))), end="")
         print()
+        for va in [int(x, 16) for x in a.peek.split(",") if x]:
+            try: print("  peek 0x%08x = 0x%08x" % (va, int.from_bytes(uc.mem_read(v2p(va), 4), "little")))
+            except UcError: print("  peek 0x%08x = <unmapped>" % va)
         print("  last accesses (type addr pc):")
         for t, ad, p in last_acc[-6:]: print("     %s 0x%08x  (pc 0x%08x %s)" % (t, ad, p, nearest(p)))
         if iring:

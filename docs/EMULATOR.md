@@ -39,28 +39,51 @@ then cleared with a one-line model entry. Current reach, in order:
 | `_gpr_shadow_check` | spins waiting for CP0 SRSCtl.HSS (shadow reg sets Unicorn lacks) | `CPU_SHIMS` sets HSS after the `mfc0` |
 | `_tx_thread_create → stack_build` | system stack at top of RAM (`0xdfffff70`) | map full 512MB DRAM (TLB even+odd pair) |
 | `tx_application_define → PoolInit → DcuGetDramAttributes` | reads DRAM-geometry index (`0x18003c10`), 0 = "Unknown main DRAM size" | `MMIO_MODEL[0x18003c10]=7` (512MB) |
-| `PoolInit → PoolCreateDirect → CreateDirect` | the pool proc structs are valid (static rodata, non-null `createFn`), it enters `CreateDirect`, then **execution reaches PC=0** | under investigation |
+| `PoolInit → CreateDirect` (null pool base) | ThreadX passes `_tx_initialize_unused_memory`=0 → null pool; root cause a bogus **EBase CPUNum** | EBase fix (below) |
+| `CCguUnitMgmtImpl::VerifyUnits` (2nd pass) | CGU self-check expects a *dynamic* enable mask (`0x2000`→`0x2100`…) we can't mirror | neuter (`NEUTER_FUNCS`) |
+| ThreadX scheduler idle | threads init, run, suspend; scheduler sits in the `wait` loop | `--tick` drives `_tx_timer_interrupt` from the idle wait |
+| **driver init (current)** | threads run FCU (flash), GPIO, NAND, `Z2cInitHw`; `Z2cInitHw+0x1d0` hits a null call after poking MMIO | driver-specific, see below |
 
 So from a cold image it now runs through CPU init, the MMU bringup, clock/DRAM self-checks,
-the ThreadX kernel, thread creation, and into memory-pool setup — hundreds of real functions.
+the ThreadX kernel, thread creation, memory-pool setup, **multithreaded scheduling with a timer
+tick**, and into **hardware driver init** (flash controller, GPIO, NAND, Z2C) — thousands of
+instructions across several cooperating threads, emitting real driver logs
+(`RES = NAND_NSR`, `Code ID: 0x%04X, Operation type: ...`).
 
-## The current wall: a null pool base reaches CreateDirect
+## The EBase CPUNum fix (the big unlock)
 
-Pinned down with `--itrace` + the register dump. The fault is `CreateDirect+0x8`
-(`sw $zero, 0x10($a0)`) with **`$a0 = 0`** — a null pool object. Tracing up: `CreateDirect`
-got it from `PoolCreateDirect`, which got it from `PoolInit`, whose own first arg
-(`$a0`/`$s0`) is already 0. So **`tx_application_define` calls `PoolInit` with a null pool
-base.** (The proc-struct lookup is fine — ruled out; `PoolGetPoolProc` returns valid static
-structs.) The write faults because vaddr `0x10` has no TLB entry, which is why it surfaces as
-PC=0 / write-unmapped.
+The null pool base traced to a **multi-core dispatch bug in the emulated CPU**: Unicorn reports
+CP0 EBase (`r15` sel 1) `CPUNum` = `0x3ff`, but this is the main core (0). The firmware selects
+per-core control blocks off `mfc0 rt,$15,1`; `_tx_initialize_low_level` branches on
+`CPUNum==0` while `_tx_initialize_kernel_enter` branches on `CPUNum==1`, so a `CPUNum` that is
+neither sends the writes and the reads to *different* blocks — `_tx_initialize_unused_memory`
+was stored in the Cop block and read back as 0 from the main block, giving a null pool base
+(the fault was `CreateDirect+0x8 sw $zero,0x10($a0)` with `$a0=0`). The emulator now scans the
+image for every EBase read and masks `CPUNum` to 0 (247 sites), so the firmware consistently
+sees core 0. This immediately got ThreadX scheduling real threads.
 
-Next step: disassemble `tx_application_define`'s call to `PoolInit` and see how it derives the
-pool base — almost certainly a DRAM-reserved-region value we haven't modeled yet (the base
-likely comes from a `DcuGetDramAttributes` output or a reserved-memory global), i.e. another
-one- or two-line model entry, consistent with every wall so far.
+## The timer tick (`--tick`)
 
-Tooling added for this: `--itrace LO:HI` (ring-buffer instruction trace over a vaddr range,
-dumped on fault) and a register dump (`A0..A3/S0/S1/SP/GP`) in the fault handler.
+ThreadX idles in `_tx_thread_schedule`'s `wait` loop when no thread is ready; on hardware a
+periodic timer IRQ runs `_tx_timer_interrupt` to expire sleeps and ready threads. With no
+interrupt source, `--tick` redirects the idle `wait` (`0xc008b2f0`) to call `_tx_timer_interrupt`
+(`0xc008ac54`) and return into the scheduler entry (`0xc008b29c`) — one idle pass = one tick.
+This unlocked the application threads, which now run driver init. (Time only advances while
+idle, so hardware the emulator doesn't model will eventually log timeouts — expected.)
+
+## The current wall: a null call in Z2cInitHw
+
+With threads running, a driver thread reaches `Z2cInitHw`, writes several MMIO registers
+(`0x10402008`, `0x1d092008`, `0x1d0a2008`), then at `Z2cInitHw+0x1d0` transfers to PC=0 — a
+null function pointer or callback for the "Z2C" hardware block that a skipped/way-later init
+would populate. This is the start of the **driver-init phase**: each block (FCU, Z2C, NAND, …)
+has its own MMIO reads and callbacks to satisfy, same loop as before. Beyond driver init lies
+NAND-backed resource loading (needed for the UI string table the label patch indexes) and
+then GUI bringup.
+
+Tooling added: `--itrace LO:HI` (instruction trace over a PC range, dumped on fault), a fault
+register + `--peek` dump, `NEUTER_FUNCS` (force a self-check to return), the EBase scan, and
+`--tick` (ThreadX timer tick).
 
 ## Methodology (how to clear the next wall)
 
