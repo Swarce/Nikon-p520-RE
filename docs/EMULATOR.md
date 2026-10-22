@@ -41,11 +41,14 @@ then cleared with a one-line model entry. Current reach, in order:
 | `tx_application_define → PoolInit → DcuGetDramAttributes` | reads DRAM-geometry index (`0x18003c10`), 0 = "Unknown main DRAM size" | `MMIO_MODEL[0x18003c10]=7` (512MB) |
 | `PoolInit → CreateDirect` (null pool base) | ThreadX passes `_tx_initialize_unused_memory`=0 → null pool; root cause a bogus **EBase CPUNum** | EBase fix (below) |
 | `CCguUnitMgmtImpl::VerifyUnits` (2nd pass) | CGU self-check expects a *dynamic* enable mask (`0x2000`→`0x2100`…) we can't mirror | neuter (`NEUTER_FUNCS`) |
-| **ThreadX scheduler idle (current)** | threads init, run (`RES = NAND_NSR`), suspend; scheduler sits in the `wait` loop | needs a **timer-tick interrupt** |
+| ThreadX scheduler idle | threads init, run, suspend; scheduler sits in the `wait` loop | `--tick` drives `_tx_timer_interrupt` from the idle wait |
+| **driver init (current)** | threads run FCU (flash), GPIO, NAND, `Z2cInitHw`; `Z2cInitHw+0x1d0` hits a null call after poking MMIO | driver-specific, see below |
 
 So from a cold image it now runs through CPU init, the MMU bringup, clock/DRAM self-checks,
-the ThreadX kernel, thread creation, memory-pool setup, **multithreaded scheduling**, and into
-driver/resource init (NAND) — thousands of real instructions across several threads.
+the ThreadX kernel, thread creation, memory-pool setup, **multithreaded scheduling with a timer
+tick**, and into **hardware driver init** (flash controller, GPIO, NAND, Z2C) — thousands of
+instructions across several cooperating threads, emitting real driver logs
+(`RES = NAND_NSR`, `Code ID: 0x%04X, Operation type: ...`).
 
 ## The EBase CPUNum fix (the big unlock)
 
@@ -59,18 +62,28 @@ was stored in the Cop block and read back as 0 from the main block, giving a nul
 image for every EBase read and masks `CPUNum` to 0 (247 sites), so the firmware consistently
 sees core 0. This immediately got ThreadX scheduling real threads.
 
-## The current wall: no timer tick
+## The timer tick (`--tick`)
 
-ThreadX has created its threads; they run, then suspend waiting on timers/events, and
-`_tx_thread_schedule` sits in its `wait` loop because `_tx_thread_execute_ptr` is null and
-nothing wakes it. The firmware needs a periodic **timer interrupt** (set up by `TimerInit`)
-whose ISR calls `_tx_timer_interrupt` to expire sleeps and ready threads. Next step: deliver
-that tick — drive the SoC/CP0 timer and have Unicorn vector the interrupt into the firmware's
-handler, or invoke `_tx_timer_interrupt` periodically from the idle loop. This is a larger step
-than the one-line models (interrupt delivery), and it unlocks the whole application layer.
+ThreadX idles in `_tx_thread_schedule`'s `wait` loop when no thread is ready; on hardware a
+periodic timer IRQ runs `_tx_timer_interrupt` to expire sleeps and ready threads. With no
+interrupt source, `--tick` redirects the idle `wait` (`0xc008b2f0`) to call `_tx_timer_interrupt`
+(`0xc008ac54`) and return into the scheduler entry (`0xc008b29c`) — one idle pass = one tick.
+This unlocked the application threads, which now run driver init. (Time only advances while
+idle, so hardware the emulator doesn't model will eventually log timeouts — expected.)
+
+## The current wall: a null call in Z2cInitHw
+
+With threads running, a driver thread reaches `Z2cInitHw`, writes several MMIO registers
+(`0x10402008`, `0x1d092008`, `0x1d0a2008`), then at `Z2cInitHw+0x1d0` transfers to PC=0 — a
+null function pointer or callback for the "Z2C" hardware block that a skipped/way-later init
+would populate. This is the start of the **driver-init phase**: each block (FCU, Z2C, NAND, …)
+has its own MMIO reads and callbacks to satisfy, same loop as before. Beyond driver init lies
+NAND-backed resource loading (needed for the UI string table the label patch indexes) and
+then GUI bringup.
 
 Tooling added: `--itrace LO:HI` (instruction trace over a PC range, dumped on fault), a fault
-register + `--peek` dump, `NEUTER_FUNCS` (force a self-check to return), and the EBase scan.
+register + `--peek` dump, `NEUTER_FUNCS` (force a self-check to return), the EBase scan, and
+`--tick` (ThreadX timer tick).
 
 ## Methodology (how to clear the next wall)
 

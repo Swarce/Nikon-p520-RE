@@ -78,6 +78,7 @@ def main():
     ap.add_argument("--peek", default="", help="comma-separated VAs (hex) to dump as words at each halt")
     ap.add_argument("--watch", default="", help="PHYS lo:hi (hex): log every read in range with PC")
     ap.add_argument("--itrace", default="", help="VADDR lo:hi (hex): ring-buffer instr trace in range, dumped on fault")
+    ap.add_argument("--tick", action="store_true", help="drive a ThreadX timer tick from the scheduler idle wait")
     a = ap.parse_args()
 
     img = bytearray(open(a.image, "rb").read())
@@ -197,6 +198,20 @@ def main():
         uc.reg_write(UC_MIPS_REG_PC, uc.reg_read(UC_MIPS_REG_RA))
     for na in NEUTER_FUNCS:
         uc.hook_add(UC_HOOK_CODE, h_neuter, begin=na, end=na)
+
+    # Timer tick: ThreadX's _tx_thread_schedule idles at `wait` (0xc008b2f0) when no thread is
+    # ready. Real hardware fires a periodic timer IRQ whose ISR runs _tx_timer_interrupt to
+    # expire sleeps and ready threads. We have no interrupt source, so when the scheduler would
+    # wait we instead call _tx_timer_interrupt (0xc008ac54) and return into the scheduler entry
+    # (0xc008b29c), which re-establishes its state and re-checks the ready list. One pass = one tick.
+    TX_WAIT, TX_TIMER_INT, TX_SCHED = 0xc008b2f0, 0xc008ac54, 0xc008b29c
+    ticks = [0]
+    def h_tick(uc, address, size, user):
+        ticks[0] += 1
+        uc.reg_write(UC_MIPS_REG_RA, TX_SCHED)
+        uc.reg_write(UC_MIPS_REG_PC, TX_TIMER_INT)
+    if a.tick:
+        uc.hook_add(UC_HOOK_CODE, h_tick, begin=TX_WAIT, end=TX_WAIT)
 
     # EBase CPUNum fix: Unicorn reports CP0 EBase (r15 sel1) CPUNum = 0x3ff, but this is the
     # main core (0). The firmware dispatches per-core off `mfc0 rt,$15,1` and picks different
