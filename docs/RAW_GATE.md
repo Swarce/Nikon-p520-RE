@@ -1,5 +1,8 @@
 # P520 RAW (NRW): where it is gated and a candidate patch (2026-10-22)
 
+> **Superseded by `RAW_ENABLE.md`.** The Fn-popup (0x33→0x32) approach below does nothing on the P520 (no Fn button); the working enable is a menu-value edit + conversion neuter, confirmed on hardware.
+
+
 With the main app decompressed (see `CODEC_SOLVED.md`), the RAW gate turns out to be a **UI menu
 link**. Capture, settings and storage all handle NRW. The P520 build just never offers it.
 
