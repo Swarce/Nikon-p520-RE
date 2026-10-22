@@ -27,22 +27,41 @@ boot ROM sets up that mapping first so `_start` can even be fetched. We start co
 3. MMIO (KSEG1 hardware registers) is caught lazily and backed as RW memory. Registers the
    firmware reads back from a *different* address than it wrote are seeded from `MMIO_MODEL`.
 
-## Current state
+## Boot progress
 
-Boots `_start → main → CguInit → CpuWdiDisable → DcuSlotMachineActivePage →
-SmdbGetActiveSlotMacId`, then the firmware's self-check panics:
+Each wall below was diagnosed from the firmware's own assert text or a symbol-resolved fault,
+then cleared with a one-line model entry. Current reach, in order:
 
-```
-[HALT] OsSysHaltEx
-   a0 -> 'Corruption of CGU_UNIT_EN1  expected: 2000  read: 0'
-   a1 -> 'Os/Cgu/CguUnits.cpp'
-```
+| stage | what happened | fix |
+|---|---|---|
+| `_start` | TLB is self-programmed (256MB pages, `0xc0000000`→`0x80000000`) | start at KSEG1 alias `0xa0000600` |
+| `main → CguInit` | `CCguUnitMgmtImpl::VerifyUnits()` reads CGU_UNIT_EN1 (`0x1000800c`), wants `0x2000` | `MMIO_MODEL[0x1000800c]=0x2000` |
+| `_gpr_shadow_check` | spins waiting for CP0 SRSCtl.HSS (shadow reg sets Unicorn lacks) | `CPU_SHIMS` sets HSS after the `mfc0` |
+| `_tx_thread_create → stack_build` | system stack at top of RAM (`0xdfffff70`) | map full 512MB DRAM (TLB even+odd pair) |
+| `tx_application_define → PoolInit → DcuGetDramAttributes` | reads DRAM-geometry index (`0x18003c10`), 0 = "Unknown main DRAM size" | `MMIO_MODEL[0x18003c10]=7` (512MB) |
+| **`PoolCreateDirect` (current)** | calls `procStruct->createFn` (`[v0+0x1c]`) which is **null** | C++ pool-proc not registered — see below |
 
-i.e. it enabled a clock-gating unit and read back the status register, which our stub returns
-as 0. This is the expected first wall: each peripheral the firmware verifies needs its
-readback modeled. The assert messages hand us the expected values, so the path forward is
-mechanical — add entries to `MMIO_MODEL` (and, where a register mirrors another, a small
-read callback) until boot proceeds.
+So from a cold image it now runs through CPU init, the MMU bringup, clock/DRAM self-checks,
+the ThreadX kernel, thread creation, and into memory-pool setup — hundreds of real functions.
+
+## The current wall: C++ static initialization
+
+The firmware is C++ (`CCguUnitMgmtImpl::`, vtables, proc structs). `PoolCreateDirect` fetches a
+pool's "create" function pointer from a proc struct and it's null — the registration that fills
+it normally runs in a **global/static constructor** (`.init_array`). The next step is to
+confirm whether `main`/crt0 runs the ctor list and, if not, invoke it (or the specific pool
+registration) before `tx_application_define`. This is a known, bounded category, not a mystery.
+
+## Methodology (how to clear the next wall)
+
+Fast, repeatable loop — most walls are one line:
+
+1. Run; read the `[HALT]` message (names the check + expected value + source file) or the
+   `[FAULT]` + recent-trace (names the function and the null/bad access).
+2. If it's a readback: `--watch LO:HI` the register page to get the exact address + reading PC,
+   disassemble that PC for the expected value, add it to `MMIO_MODEL`.
+3. If it's a CPU-feature spin: add a `CPU_SHIMS` entry (like SRSCtl).
+4. If it's a null call/structure: find the init that should have populated it.
 
 ## Usage
 

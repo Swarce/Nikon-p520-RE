@@ -29,19 +29,30 @@ from unicorn import *
 from unicorn.mips_const import *
 
 P_LOW, SZ_LOW   = 0x00000000, 0x01000000      # KSEG1 alias of low image (bootstrap fetch)
-P_DRAM, SZ_DRAM = 0x80000000, 0x10000000      # vaddr 0xc0000000..0xd0000000 -> here (256MB)
+P_DRAM, SZ_DRAM = 0x80000000, 0x20000000      # vaddr 0xc0000000..0xe0000000 -> here (512MB,
+                                              # the TLB's 256MB even+odd pages, contiguous)
 START           = 0xa0000600                  # KSEG1 alias of _start
 
 # Seed specific MMIO readback registers: phys_addr -> value. Grow this as asserts reveal
 # expected values. (phys = KSEG1 vaddr & 0x1fffffff.)
 MMIO_MODEL = {
-    # 0x...: 0x2000,   # CGU_UNIT_EN1 status  (from "CGU_UNIT_EN1 expected: 2000")
+    0x1000800c: 0x2000,   # CGU_UNIT_EN1 status, read by CCguUnitMgmtImpl::VerifyUnits()
+    0x18003c10: 7,        # DRAM geometry index (DcuGetDramAttributes); 7 = 512MB (matches map)
+}
+
+# CPU-feature shims: Unicorn's MIPS core omits some CP0 features the firmware probes for in
+# tight spin loops (as it omits the boot-ROM TLB setup). Each entry patches a GPR right after
+# the mfc0 that read the missing feature, so the probe sees a sane value. addr -> (reg, OR-mask).
+CPU_SHIMS = {
+    # _gpr_shadow_check: after `mfc0 $t3, SRSCtl`, force HSS (bits 29:26) nonzero so the
+    # "wait for shadow register sets" loop (beqz $t4,self @0xc008b52c) exits.
+    0xc008b528: ("T3", 0x0C000000),
 }
 
 def v2p(a):
     a &= 0xffffffff
-    if 0xc0000000 <= a < 0xd0000000: return P_DRAM + (a - 0xc0000000)
-    if 0xe0000000 <= a < 0xf0000000: return P_DRAM + (a - 0xe0000000)
+    if 0xc0000000 <= a < 0xe0000000: return P_DRAM + (a - 0xc0000000)   # cached, 512MB
+    if 0xe0000000 <= a < 0xf0000000: return P_DRAM + (a - 0xe0000000)   # uncached alias
     if 0x80000000 <= a < 0xc0000000: return a & 0x1fffffff
     return a
 
@@ -54,6 +65,12 @@ def main():
     ap.add_argument("--max-insn", type=int, default=8_000_000)
     ap.add_argument("--timeout", type=int, default=25, help="seconds")
     ap.add_argument("--mmio", action="store_true", help="log first touch of each MMIO page")
+    ap.add_argument("--skip-halts", action="store_true",
+                    help="log asserts/halts and return instead of stopping (explore boot flow)")
+    ap.add_argument("--skip-match", default="", help="comma-separated substrings: skip only halts whose message matches")
+    ap.add_argument("--skip-limit", type=int, default=400, help="stop after this many skipped halts")
+    ap.add_argument("--peek", default="", help="comma-separated VAs (hex) to dump as words at each halt")
+    ap.add_argument("--watch", default="", help="PHYS lo:hi (hex): log every read in range with PC")
     a = ap.parse_args()
 
     img = bytearray(open(a.image, "rb").read())
@@ -116,14 +133,24 @@ def main():
         ad = name2addr.get(nm)
         if ad: uc.hook_add(UC_HOOK_CODE, h_printf, begin=ad, end=ad)
 
+    halts = [0]
     def h_halt(uc, addr, size, user):
         args = [uc.reg_read(r) for r in (UC_MIPS_REG_A0, UC_MIPS_REG_A1, UC_MIPS_REG_A2, UC_MIPS_REG_A3)]
-        print("\n[HALT] %s  args=%s" % (nearest(addr), " ".join("0x%08x" % x for x in args)))
-        for i, x in enumerate(args):
-            s = rd_cstr(x)
-            if sum(c.isprintable() for c in s) > 3: print("   a%d -> %r" % (i, s))
-        print("   from RA=0x%08x (%s)" % (uc.reg_read(UC_MIPS_REG_RA), nearest(uc.reg_read(UC_MIPS_REG_RA))))
-        uc.emu_stop()
+        msg = next((rd_cstr(x) for x in args if sum(c.isprintable() for c in rd_cstr(x)) > 3), "")
+        ra = uc.reg_read(UC_MIPS_REG_RA)
+        print("[HALT] %s  %r  (from %s)" % (nearest(addr), msg.replace("\x1b", " ").replace("\n", " / "), nearest(ra)))
+        for va in [int(x, 16) for x in a.peek.split(",") if x]:
+            try: print("   peek 0x%08x = 0x%08x" % (va, int.from_bytes(uc.mem_read(v2p(va), 4), "little")))
+            except UcError: print("   peek 0x%08x = <unmapped>" % va)
+        for x in recent[-14:]: print("     . 0x%08x  %s" % (x, nearest(x)))
+        match = any(m and m in msg for m in a.skip_match.split(","))
+        if a.skip_halts or match:
+            halts[0] += 1
+            if halts[0] >= a.skip_limit:
+                print("[skip-limit reached]"); uc.emu_stop(); return
+            uc.reg_write(UC_MIPS_REG_PC, ra)       # return to caller, skip the halt
+        else:
+            uc.emu_stop()
     for nm in ("OsSysHaltEx", "OsSysHalt", "OsAssert", "OsSysAssert"):
         ad = name2addr.get(nm)
         if ad: uc.hook_add(UC_HOOK_CODE, h_halt, begin=ad, end=ad)
@@ -139,6 +166,21 @@ def main():
         else:
             print("[trace] unknown symbol: %s" % nm)
 
+    if a.watch:
+        wlo, whi = (int(x, 16) for x in a.watch.split(":"))
+        def h_watch(uc, access, address, size, value, user):
+            if wlo <= address < whi:
+                pc = uc.reg_read(UC_MIPS_REG_PC)
+                print("[watch R] phys 0x%08x sz%d pc=0x%08x(%s)" % (address, size, pc, nearest(pc)))
+        uc.hook_add(UC_HOOK_MEM_READ, h_watch, begin=wlo, end=whi)
+
+    import unicorn.mips_const as mc
+    def mk_shim(regname, mask):
+        reg = getattr(mc, "UC_MIPS_REG_" + regname)
+        return lambda uc, address, size, user: uc.reg_write(reg, uc.reg_read(reg) | mask)
+    for sa, (rn, mask) in CPU_SHIMS.items():
+        uc.hook_add(UC_HOOK_CODE, mk_shim(rn, mask), begin=sa, end=sa)
+
     recent = []
     def h_blk(uc, address, size, user):
         recent.append(address)
@@ -151,6 +193,10 @@ def main():
         uc.emu_start(START, 0, timeout=a.timeout * 1_000_000, count=a.max_insn)
         print("[stop] limit/return; PC=0x%08x (%s)" %
               (uc.reg_read(UC_MIPS_REG_PC), nearest(uc.reg_read(UC_MIPS_REG_PC))))
+        from collections import Counter
+        c = Counter(nearest(x).split("+")[0] for x in recent)
+        print("  recent block funcs:", dict(c))
+        for x in recent[-12:]: print("     . 0x%08x  %s" % (x, nearest(x)))
     except UcError as e:
         pc = uc.reg_read(UC_MIPS_REG_PC)
         print("\n[FAULT] %s  PC=0x%08x (%s)  RA=0x%08x (%s)" % (e, pc, nearest(pc),
