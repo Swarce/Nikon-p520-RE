@@ -44,16 +44,23 @@ then cleared with a one-line model entry. Current reach, in order:
 So from a cold image it now runs through CPU init, the MMU bringup, clock/DRAM self-checks,
 the ThreadX kernel, thread creation, and into memory-pool setup — hundreds of real functions.
 
-## The current wall: a jump to PC=0 inside pool CreateDirect
+## The current wall: a null pool base reaches CreateDirect
 
-Ruled out: the pool-proc lookup. `PoolGetPoolProc` returns valid static structs and their
-`createFn` (`+0x1c`) points at real code (`CreateDirect` @ `0xc0016328`), which the emulator
-does enter. Shortly after, the PC becomes 0 (a null call or a corrupted return). `CreateDirect`
-calls `Init` (`0xc00161d4`); the likely causes are (a) a function pointer / callback that a
-skipped init left null, or (b) the firmware's low-address TLB entry (vaddr 0 → phys
-`0x40000000`, set by the helper at `0xc00006c4` which cold start hasn't run) so a low-address
-access misbehaves. Next step: instruction-level single-step across the last block before the
-fault to see the exact transfer to 0. The fault handler now prints the recent accesses to help.
+Pinned down with `--itrace` + the register dump. The fault is `CreateDirect+0x8`
+(`sw $zero, 0x10($a0)`) with **`$a0 = 0`** — a null pool object. Tracing up: `CreateDirect`
+got it from `PoolCreateDirect`, which got it from `PoolInit`, whose own first arg
+(`$a0`/`$s0`) is already 0. So **`tx_application_define` calls `PoolInit` with a null pool
+base.** (The proc-struct lookup is fine — ruled out; `PoolGetPoolProc` returns valid static
+structs.) The write faults because vaddr `0x10` has no TLB entry, which is why it surfaces as
+PC=0 / write-unmapped.
+
+Next step: disassemble `tx_application_define`'s call to `PoolInit` and see how it derives the
+pool base — almost certainly a DRAM-reserved-region value we haven't modeled yet (the base
+likely comes from a `DcuGetDramAttributes` output or a reserved-memory global), i.e. another
+one- or two-line model entry, consistent with every wall so far.
+
+Tooling added for this: `--itrace LO:HI` (ring-buffer instruction trace over a vaddr range,
+dumped on fault) and a register dump (`A0..A3/S0/S1/SP/GP`) in the fault handler.
 
 ## Methodology (how to clear the next wall)
 

@@ -71,6 +71,7 @@ def main():
     ap.add_argument("--skip-limit", type=int, default=400, help="stop after this many skipped halts")
     ap.add_argument("--peek", default="", help="comma-separated VAs (hex) to dump as words at each halt")
     ap.add_argument("--watch", default="", help="PHYS lo:hi (hex): log every read in range with PC")
+    ap.add_argument("--itrace", default="", help="VADDR lo:hi (hex): ring-buffer instr trace in range, dumped on fault")
     a = ap.parse_args()
 
     img = bytearray(open(a.image, "rb").read())
@@ -192,6 +193,21 @@ def main():
         if len(recent) > 24: recent.pop(0)
     uc.hook_add(UC_HOOK_BLOCK, h_blk)
 
+    iring = []
+    if a.itrace:
+        import capstone as _cs
+        _md = _cs.Cs(_cs.CS_ARCH_MIPS, _cs.CS_MODE_MIPS32 + _cs.CS_MODE_LITTLE_ENDIAN)
+        ilo, ihi = (int(x, 16) for x in a.itrace.split(":"))
+        def h_itrace(uc, address, size, user):
+            try:
+                code = uc.mem_read(v2p(address), size)
+                ins = next(_md.disasm(bytes(code), address), None)
+                iring.append((address, "%s %s" % (ins.mnemonic, ins.op_str) if ins else "?"))
+            except Exception:
+                iring.append((address, "?"))
+            if len(iring) > 40: iring.pop(0)
+        uc.hook_add(UC_HOOK_CODE, h_itrace, begin=ilo, end=ihi)
+
     print("[run] %s  start @0x%08x  cap %d insn / %ds" % (a.image, START, a.max_insn, a.timeout))
     uc.reg_write(UC_MIPS_REG_PC, START)
     try:
@@ -206,8 +222,14 @@ def main():
         pc = uc.reg_read(UC_MIPS_REG_PC)
         print("\n[FAULT] %s  PC=0x%08x (%s)  RA=0x%08x (%s)" % (e, pc, nearest(pc),
               uc.reg_read(UC_MIPS_REG_RA), nearest(uc.reg_read(UC_MIPS_REG_RA))))
+        for rn in ("A0", "A1", "A2", "A3", "S0", "S1", "SP", "GP"):
+            print("  %-3s=0x%08x" % (rn, uc.reg_read(getattr(__import__('unicorn.mips_const', fromlist=['x']), 'UC_MIPS_REG_' + rn))), end="")
+        print()
         print("  last accesses (type addr pc):")
         for t, ad, p in last_acc[-6:]: print("     %s 0x%08x  (pc 0x%08x %s)" % (t, ad, p, nearest(p)))
+        if iring:
+            print("  instr trace (last %d in range):" % min(len(iring), 24))
+            for ad, dis in iring[-24:]: print("     0x%08x  %-7s  %s" % (ad, nearest(ad), dis))
         for x in recent[-16:]: print("    0x%08x  %s" % (x, nearest(x)))
 
 if __name__ == "__main__":
